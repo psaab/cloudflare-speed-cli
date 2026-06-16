@@ -296,10 +296,11 @@ async fn bind_and_connect_udp(
     // without device binding); --interface itself is applied as a device bind in
     // build_udp_socket so dual-stack candidate selection still works.
     let bind_addr = cfg.resolved_bind_ip.map(|ip| SocketAddr::new(ip, 0));
+    let dscp_dist = super::dscp::DscpDist::from_weights(&cfg.dscp);
 
     let mut last_err: Option<anyhow::Error> = None;
     for &addr in candidates {
-        let sock = match build_udp_socket(addr, bind_addr, cfg.interface.as_deref()) {
+        let sock = match build_udp_socket(addr, bind_addr, cfg.interface.as_deref(), dscp_dist.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(e);
@@ -325,6 +326,7 @@ fn build_udp_socket(
     target: SocketAddr,
     bind_addr: Option<SocketAddr>,
     interface: Option<&str>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<UdpSocket> {
     let is_ipv6 = bind_addr.map(|a| a.is_ipv6()).unwrap_or(target.is_ipv6());
 
@@ -344,6 +346,11 @@ fn build_udp_socket(
     if let Some(iface) = interface {
         network_bind::bind_socket_to_device(&std_socket, iface, is_ipv6)
             .map_err(|e| anyhow!("Failed to bind to interface {}: {}", iface, e))?;
+    }
+
+    // Best-effort DSCP marking before the socket starts sending.
+    if let Some(dist) = dscp {
+        let _ = super::dscp::apply(&std_socket, dist.select(), is_ipv6);
     }
 
     std_socket.set_nonblocking(true)?;

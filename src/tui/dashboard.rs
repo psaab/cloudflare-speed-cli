@@ -752,6 +752,14 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ]));
     }
 
+    // Only show DSCP line if marking is enabled
+    if let Some(ref dscp) = state.dscp_label {
+        network_lines.push(Line::from(vec![
+            Span::styled("DSCP: ", Style::default().fg(Color::Gray)),
+            Span::styled(dscp.clone(), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
     network_lines.push(Line::from(vec![
         Span::styled("Server location: ", Style::default().fg(Color::Gray)),
         Span::styled(
@@ -1252,6 +1260,14 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
         meta_lines.push(Line::from(vec![
             Span::styled("Proxy: ", Style::default().fg(Color::Gray)),
             Span::styled(proxy_url, Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    // Only show DSCP line if marking is enabled
+    if let Some(ref dscp) = state.dscp_label {
+        meta_lines.push(Line::from(vec![
+            Span::styled("DSCP: ", Style::default().fg(Color::Gray)),
+            Span::styled(dscp, Style::default().fg(Color::Yellow)),
         ]));
     }
 

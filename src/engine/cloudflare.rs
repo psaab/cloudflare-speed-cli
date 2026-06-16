@@ -80,6 +80,14 @@ impl CloudflareClient {
             builder = builder.proxy(proxy);
         }
 
+        // Mark download/upload/latency sockets with the requested DSCP
+        // distribution. Each new connection independently draws a weighted value
+        // via the per-connection picker. `tos_picker()` is provided by the
+        // vendored reqwest fork (see vendor/).
+        if let Some(dist) = super::dscp::DscpDist::from_weights(&cfg.dscp) {
+            builder = builder.tos_picker(dist.picker());
+        }
+
         let http = builder.build().context("failed to build http client")?;
 
         Ok(Self {

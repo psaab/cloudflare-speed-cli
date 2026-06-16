@@ -37,6 +37,12 @@ pub struct Cli {
     #[arg(long, default_value = "10s")]
     pub upload_duration: humantime::Duration,
 
+    /// Trailing window over which the live throughput rate is averaged. Larger
+    /// values smooth bursty links (e.g. satellite) more; smaller values react
+    /// faster but show more jitter.
+    #[arg(long, default_value = "1s")]
+    pub rate_window: humantime::Duration,
+
     /// Idle latency probe duration (pre-test)
     #[arg(long, default_value = "2s")]
     pub idle_latency_duration: humantime::Duration,
@@ -140,6 +146,18 @@ pub struct Cli {
     /// Useful for sharing screenshots or recording demos. Toggle at runtime with Shift+H.
     #[arg(long)]
     pub hide_network_info: bool,
+
+    /// Mark all test sockets with one or more DSCP values for QoS classification,
+    /// including the HTTP download/upload throughput (via a vendored reqwest
+    /// fork), TLS handshake, UDP/STUN packet-loss probe, and traceroute. Each
+    /// new connection independently draws a value from the weighted set.
+    ///
+    /// Format: `tos:weight,tos:weight,...` where `tos` is a keyword (ef, cs5,
+    /// af41, le, be) or a number 0-63 (decimal or 0x hex). With explicit weights,
+    /// they must sum to 100; omit weights for an equal split (e.g. `ef,cs1`); a
+    /// single value (e.g. `ef`) is 100%. Unix only.
+    #[arg(long, value_name = "DSCP")]
+    pub dscp: Option<String>,
 }
 
 pub async fn run(args: Cli) -> Result<()> {
@@ -238,6 +256,17 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
     // --ipv6-only, etc.). For --interface we already selected a matching family.
     network_bind::resolve_ip_family(args.ipv4_only, args.ipv6_only, resolved_bind_ip)?;
 
+    // Resolve the DSCP marking once so an invalid value fails fast with a clear
+    // message. The user-facing notice is emitted by the caller (see
+    // `dscp_notice`), NOT here, for the same TUI-alternate-screen reason as the
+    // bind notice above.
+    let dscp = match args.dscp.as_deref() {
+        Some(spec) => {
+            crate::engine::dscp::parse_dscp_weights(spec).context("invalid --dscp value")?
+        }
+        None => Vec::new(),
+    };
+
     Ok(RunConfig {
         base_url: args.base_url.clone(),
         meas_id: gen_meas_id(),
@@ -248,6 +277,7 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
         idle_latency_duration: Duration::from(args.idle_latency_duration),
         download_duration: Duration::from(args.download_duration),
         upload_duration: Duration::from(args.upload_duration),
+        rate_window: Duration::from(args.rate_window),
         probe_interval_ms: args.probe_interval_ms,
         probe_timeout_ms: args.probe_timeout_ms,
         user_agent: format!("cloudflare-speed-cli/{}", env!("CARGO_PKG_VERSION")),
@@ -266,6 +296,7 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
         ipv4_only: args.ipv4_only,
         ipv6_only: args.ipv6_only,
         udp_packets: args.udp_packets,
+        dscp,
     })
 }
 
@@ -290,12 +321,29 @@ pub fn bind_notice(cfg: &RunConfig) -> Option<String> {
     }
 }
 
+/// One-line summary of the active DSCP marking, or `None` when no `--dscp` was
+/// given. Shown on stderr in text/json modes and inside the Network Information
+/// panel in the TUI.
+pub fn dscp_notice(cfg: &RunConfig) -> Option<String> {
+    crate::engine::dscp::DscpDist::from_weights(&cfg.dscp).map(|dist| {
+        format!(
+            "Marking all test sockets (HTTP throughput, TLS, UDP, traceroute); \
+             per-connection DSCP distribution: {}. \
+             (0x.. is the byte written to IPv4 IP_TOS / IPv6 IPV6_TCLASS.)",
+            dist.describe()
+        )
+    })
+}
+
 /// Common function to run the test engine and process results.
 /// `silent` controls whether JSON is printed and whether save errors propagate.
 async fn run_test_engine(args: Cli, silent: bool) -> Result<()> {
     let cfg = build_config(&args)?;
     if !silent {
         if let Some(msg) = bind_notice(&cfg) {
+            eprintln!("{}", msg);
+        }
+        if let Some(msg) = dscp_notice(&cfg) {
             eprintln!("{}", msg);
         }
     }
@@ -364,6 +412,9 @@ async fn run_test_engine(args: Cli, silent: bool) -> Result<()> {
 async fn run_text(args: Cli) -> Result<()> {
     let cfg = build_config(&args)?;
     if let Some(msg) = bind_notice(&cfg) {
+        eprintln!("{}", msg);
+    }
+    if let Some(msg) = dscp_notice(&cfg) {
         eprintln!("{}", msg);
     }
     let (evt_tx, mut evt_rx) = mpsc::channel::<TestEvent>(2048);

@@ -59,6 +59,15 @@ path = "src/main.rs"
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:arboard", "dep:ratatui-textarea"]
 
+# Vendored forks of reqwest and hyper-util that add DSCP / IP_TOS socket marking
+# (the `--dscp` flag). Upstream exposes no API to set IP_TOS/IPV6_TCLASS on the
+# HTTP throughput sockets, so the patched copies under vendor/ add a per-connection
+# TOS picker that threads down to the hyper-util connector.
+# NOTE: these path patches make the crate unpublishable to crates.io.
+[patch.crates-io]
+reqwest = { path = "vendor/reqwest" }
+hyper-util = { path = "vendor/hyper-util" }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

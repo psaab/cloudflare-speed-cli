@@ -43,6 +43,7 @@ pub async fn measure_tls_handshake(
     interface: Option<&str>,
     bind_ip: Option<IpAddr>,
     family: Option<IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<TlsSummary> {
     // Ensure the crypto provider is installed
     ensure_crypto_provider();
@@ -72,7 +73,7 @@ pub async fn measure_tls_handshake(
     let connector = TlsConnector::from(Arc::new(config));
 
     // Resolve and connect, trying each address until one succeeds.
-    let tcp_stream = connect_tcp(hostname, port, interface, bind_ip, family).await?;
+    let tcp_stream = connect_tcp(hostname, port, interface, bind_ip, family, dscp).await?;
 
     // Parse server name for TLS
     let server_name: ServerName<'static> = hostname
@@ -114,6 +115,7 @@ async fn connect_tcp(
     interface: Option<&str>,
     bind_ip: Option<IpAddr>,
     family: Option<IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<tokio::net::TcpStream> {
     let lookup_target = format!("{}:{}", hostname, port);
     let resolved: Vec<SocketAddr> = lookup_host(&lookup_target)
@@ -171,6 +173,12 @@ async fn connect_tcp(
                     Some(anyhow!(e).context(format!("failed to bind to interface {}", iface)));
                 continue;
             }
+        }
+
+        // Best-effort DSCP marking; an unsupported platform/option shouldn't
+        // fail the handshake measurement.
+        if let Some(dist) = dscp {
+            let _ = super::dscp::apply(&socket, dist.select(), addr.is_ipv6());
         }
 
         match timeout(CONNECT_TIMEOUT, socket.connect(addr)).await {

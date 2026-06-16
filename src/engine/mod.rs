@@ -1,6 +1,7 @@
 mod cert;
 mod cloudflare;
 pub mod dns;
+pub mod dscp;
 pub mod ip_comparison;
 mod latency;
 pub mod network_bind;
@@ -62,6 +63,11 @@ impl TestEngine {
         )?;
 
         let client = cloudflare::CloudflareClient::new(&self.cfg, family).await?;
+
+        // Weighted DSCP distribution shared by the directly-created sockets
+        // (TLS, external-IP fetch, IP comparison, traceroute). The reqwest-based
+        // clients build their own picker from `cfg.dscp` internally.
+        let dscp_dist = dscp::DscpDist::from_weights(&self.cfg.dscp);
 
         let paused = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -200,6 +206,7 @@ impl TestEngine {
                     self.cfg.interface.as_deref(),
                     self.cfg.resolved_bind_ip,
                     family,
+                    dscp_dist.as_ref(),
                 )
                 .await
                 {
@@ -232,6 +239,7 @@ impl TestEngine {
                 self.cfg.resolved_bind_ip,
                 self.cfg.certificate_path.as_deref(),
                 family,
+                dscp_dist.as_ref(),
             )
             .await;
             external_ipv4 = v4.clone();
@@ -258,6 +266,7 @@ impl TestEngine {
                 self.cfg.resolved_bind_ip,
                 self.cfg.certificate_path.as_deref(),
                 family,
+                dscp_dist.as_ref(),
             )
             .await
             {
@@ -301,6 +310,7 @@ impl TestEngine {
                     self.cfg.resolved_bind_ip,
                     self.cfg.interface.as_deref(),
                     family,
+                    dscp_dist.as_ref(),
                 )
                 .await
                 {

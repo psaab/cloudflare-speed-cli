@@ -85,6 +85,12 @@ pub async fn run(args: Cli) -> Result<()> {
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
     state.proxy_url = args.proxy.clone();
+    state.dscp_label = args
+        .dscp
+        .as_deref()
+        .and_then(|s| crate::engine::dscp::parse_dscp_weights(s).ok())
+        .and_then(|w| crate::engine::dscp::DscpDist::from_weights(&w))
+        .map(|d| d.describe());
     state.traceroute_enabled = args.traceroute;
     state.traceroute_max_hops = args.traceroute_max_hops;
 

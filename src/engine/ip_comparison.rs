@@ -17,6 +17,7 @@ const TEST_DURATION: Duration = Duration::from_secs(3);
 ///
 /// Resolves the hostname to both IPv4 and IPv6 addresses, then runs
 /// abbreviated speed tests on each protocol.
+#[allow(clippy::too_many_arguments)]
 pub async fn compare_ip_versions(
     base_url: &str,
     user_agent: &str,
@@ -24,6 +25,7 @@ pub async fn compare_ip_versions(
     bind_ip: Option<IpAddr>,
     cert_path: Option<&std::path::Path>,
     family: Option<IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<IpVersionComparison> {
     let url = Url::parse(base_url)?;
     let hostname = url
@@ -59,7 +61,7 @@ pub async fn compare_ip_versions(
     let ipv4_result = Some(if !test_v4 {
         skipped_result(family)
     } else if let Some(ip) = ipv4_addr {
-        test_ip_version(base_url, hostname, port, ip, user_agent, interface, bind_ip, cert_path).await
+        test_ip_version(base_url, hostname, port, ip, user_agent, interface, bind_ip, cert_path, dscp).await
     } else {
         unavailable_result("No IPv4 address resolved")
     });
@@ -68,7 +70,7 @@ pub async fn compare_ip_versions(
     let ipv6_result = Some(if !test_v6 {
         skipped_result(family)
     } else if let Some(ip) = ipv6_addr {
-        test_ip_version(base_url, hostname, port, ip, user_agent, interface, bind_ip, cert_path).await
+        test_ip_version(base_url, hostname, port, ip, user_agent, interface, bind_ip, cert_path, dscp).await
     } else {
         unavailable_result("No IPv6 address resolved")
     });
@@ -110,6 +112,7 @@ async fn test_ip_version(
     interface: Option<&str>,
     bind_ip: Option<IpAddr>,
     cert_path: Option<&std::path::Path>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> IpVersionResult {
     use super::network_bind;
 
@@ -134,6 +137,9 @@ async fn test_ip_version(
                 };
             }
         }
+    }
+    if let Some(dist) = dscp {
+        builder = builder.tos_picker(dist.picker());
     }
     let client = match network_bind::apply_bind(builder, interface, bind_ip).build() {
         Ok(c) => c,

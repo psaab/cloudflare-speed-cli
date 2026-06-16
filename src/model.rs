@@ -36,6 +36,9 @@ pub struct RunConfig {
     pub download_duration: Duration,
     #[serde(with = "humantime_serde")]
     pub upload_duration: Duration,
+    /// Trailing window over which the live throughput rate is averaged.
+    #[serde(with = "humantime_serde")]
+    pub rate_window: Duration,
     pub probe_interval_ms: u64,
     pub probe_timeout_ms: u64,
     pub user_agent: String,
@@ -55,6 +58,10 @@ pub struct RunConfig {
     pub ipv4_only: bool,
     pub ipv6_only: bool,
     pub udp_packets: u64,
+    /// Weighted DSCP values applied per-connection across all test sockets.
+    /// Empty means no marking (system default).
+    #[serde(default)]
+    pub dscp: Vec<crate::engine::dscp::DscpWeight>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

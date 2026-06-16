@@ -44,6 +44,41 @@ fn throughput_summary(bytes: u64, duration: Duration, mbps_samples: &[f64]) -> T
     }
 }
 
+/// Throughput (bytes/sec) over a trailing `window`, derived from the cumulative
+/// `(timestamp, bytes)` timeline. Smooths the per-tick rate so high-variance
+/// links (e.g. satellite) don't swing wildly or flash 0 Bps on a momentary
+/// stall. `floor` keeps the window from reaching before a warm-up boundary;
+/// `samples` must include a leading `(start, 0)` seed so early ticks have
+/// something to measure against.
+fn windowed_bps(
+    samples: &[(Instant, u64)],
+    start: Instant,
+    window: Duration,
+    floor: Duration,
+) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let last_idx = samples.len() - 1;
+    let (now, now_total) = samples[last_idx];
+    let now_el = now.saturating_duration_since(start);
+    let win_start_el = now_el.saturating_sub(window).max(floor);
+    // Anchor on the first sample at/after the window start, but never on the
+    // current sample itself (which would give dt=0); fall back to the previous
+    // sample so the window is at least one tick wide.
+    let start_idx = samples[..last_idx]
+        .iter()
+        .position(|(t, _)| t.saturating_duration_since(start) >= win_start_el)
+        .unwrap_or(last_idx - 1);
+    let (t0, b0) = samples[start_idx];
+    let dt = now.saturating_duration_since(t0).as_secs_f64();
+    if dt > 1e-9 {
+        (now_total.saturating_sub(b0)) as f64 / dt
+    } else {
+        0.0
+    }
+}
+
 fn estimate_steady_window(
     samples: &[(Instant, u64)],
     total_duration: Duration,
@@ -157,10 +192,11 @@ pub async fn run_download_with_loaded_latency(
     });
 
     let start = Instant::now();
-    let mut last_bytes = 0u64;
-    let mut last_t = Instant::now();
+    // Seed with (start, 0) so the first tick measures against the run start.
     let mut samples: Vec<(Instant, u64)> = Vec::with_capacity(256);
+    samples.push((start, 0));
     let mut mbps_samples: Vec<f64> = Vec::with_capacity(256);
+    let mut emitted_any = false;
 
     while start.elapsed() < cfg.download_duration {
         if wait_if_paused_or_cancelled(&paused, &cancel).await {
@@ -169,15 +205,21 @@ pub async fn run_download_with_loaded_latency(
 
         tokio::time::sleep(THROUGHPUT_SAMPLE_INTERVAL).await;
 
+        let now = Instant::now();
         let now_total = total.load(Ordering::Relaxed);
-        let dt = last_t.elapsed().as_secs_f64().max(1e-9);
-        let dbytes = now_total.saturating_sub(last_bytes);
-        let bps_instant = (dbytes as f64) / dt;
-        let mbps_instant = (bps_instant * 8.0) / 1_000_000.0;
-        last_t = Instant::now();
-        last_bytes = now_total;
-        samples.push((Instant::now(), now_total));
-        mbps_samples.push(mbps_instant);
+        samples.push((now, now_total));
+
+        // Rate over a trailing window so bursty links read smoothly.
+        let bps_instant = windowed_bps(&samples, start, cfg.rate_window, Duration::ZERO);
+
+        // Don't open the display with a spurious 0 from slow-start; once data is
+        // flowing, emit every tick (genuine mid-test stalls still show).
+        if !emitted_any && bps_instant <= 0.0 {
+            continue;
+        }
+        emitted_any = true;
+
+        mbps_samples.push((bps_instant * 8.0) / 1_000_000.0);
 
         event_tx
             .send(TestEvent::ThroughputTick {
@@ -303,11 +345,23 @@ pub async fn run_upload_with_loaded_latency(
         let _ = lat_tx.send(res).await;
     });
 
+    // Upload bytes are counted as the request body is *produced* for reqwest,
+    // which races ahead of the wire while the kernel send buffers and the
+    // HTTP/2 flow-control window fill. That prefill inflates the first
+    // instantaneous samples. Ignore an initial warm-up so neither the live ticks
+    // nor the summary mean are polluted; the window mirrors
+    // `estimate_steady_window`'s ramp-up trim.
+    let warmup = cfg
+        .upload_duration
+        .mul_f64(0.25)
+        .clamp(Duration::from_millis(400), Duration::from_secs(2));
+
     let start = Instant::now();
-    let mut last_bytes = 0u64;
-    let mut last_t = Instant::now();
+    // Seed with (start, 0) so the trailing-window rate has a baseline.
     let mut samples: Vec<(Instant, u64)> = Vec::with_capacity(256);
+    samples.push((start, 0));
     let mut mbps_samples: Vec<f64> = Vec::with_capacity(256);
+    let mut emitted_any = false;
 
     while start.elapsed() < cfg.upload_duration {
         if wait_if_paused_or_cancelled(&paused, &cancel).await {
@@ -316,15 +370,28 @@ pub async fn run_upload_with_loaded_latency(
 
         tokio::time::sleep(THROUGHPUT_SAMPLE_INTERVAL).await;
 
+        let now = Instant::now();
         let now_total = total.load(Ordering::Relaxed);
-        let dt = last_t.elapsed().as_secs_f64().max(1e-9);
-        let dbytes = now_total.saturating_sub(last_bytes);
-        let bps_instant = (dbytes as f64) / dt;
-        let mbps_instant = (bps_instant * 8.0) / 1_000_000.0;
-        last_t = Instant::now();
-        last_bytes = now_total;
-        samples.push((Instant::now(), now_total));
-        mbps_samples.push(mbps_instant);
+        // Keep the byte timeline for the steady-window estimate, but drop the
+        // warm-up from the displayed/averaged rate.
+        samples.push((now, now_total));
+        if start.elapsed() < warmup {
+            continue;
+        }
+
+        // Trailing-window rate, floored at the warm-up boundary so the prefill
+        // is excluded and bursty links read smoothly (no 0 Bps on a stall).
+        let bps_instant = windowed_bps(&samples, start, cfg.rate_window, warmup);
+
+        // The first window at the warm-up boundary is one tick wide and often
+        // lands on a production pause (send buffers just filled), reading 0.
+        // Skip leading zeros so the display doesn't open with one.
+        if !emitted_any && bps_instant <= 0.0 {
+            continue;
+        }
+        emitted_any = true;
+
+        mbps_samples.push((bps_instant * 8.0) / 1_000_000.0);
 
         event_tx
             .send(TestEvent::ThroughputTick {
@@ -376,4 +443,69 @@ pub async fn run_upload_with_loaded_latency(
     let _ = lat_handle.await;
 
     Ok((up, loaded_latency))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a cumulative (timestamp, bytes) timeline from `(elapsed_ms, bytes)`
+    /// pairs anchored at a common start.
+    fn timeline(start: Instant, points: &[(u64, u64)]) -> Vec<(Instant, u64)> {
+        points
+            .iter()
+            .map(|&(ms, bytes)| (start + Duration::from_millis(ms), bytes))
+            .collect()
+    }
+
+    #[test]
+    fn windowed_bps_steady_rate() {
+        let start = Instant::now();
+        // 100 kB every 200 ms = 500 kB/s, for 2 s.
+        let mut pts = vec![(0u64, 0u64)];
+        for i in 1..=10 {
+            pts.push((200 * i, 100_000 * i));
+        }
+        let s = timeline(start, &pts);
+        let bps = windowed_bps(&s, start, Duration::from_millis(1000), Duration::ZERO);
+        assert!((bps - 500_000.0).abs() < 1.0, "got {bps}");
+    }
+
+    #[test]
+    fn windowed_bps_smooths_momentary_stall() {
+        let start = Instant::now();
+        // The last tick advanced 0 bytes (a stall), but the surrounding window
+        // had traffic — the windowed rate must stay positive, not read 0.
+        let s = timeline(start, &[(0, 0), (200, 100_000), (400, 200_000), (600, 200_000)]);
+        let bps = windowed_bps(&s, start, Duration::from_millis(1000), Duration::ZERO);
+        assert!(bps > 0.0, "stall flashed 0: {bps}");
+    }
+
+    #[test]
+    fn windowed_bps_floor_excludes_warmup_prefill() {
+        let start = Instant::now();
+        // Big prefill counted at 200 ms, then steady 50 kB/200 ms afterwards.
+        // With a 400 ms floor the prefill is excluded.
+        let s = timeline(
+            start,
+            &[(0, 0), (200, 1_000_000), (400, 1_050_000), (600, 1_100_000)],
+        );
+        let bps = windowed_bps(
+            &s,
+            start,
+            Duration::from_millis(1000),
+            Duration::from_millis(400),
+        );
+        assert!((bps - 250_000.0).abs() < 1.0, "prefill leaked in: {bps}");
+    }
+
+    #[test]
+    fn windowed_bps_zero_duration_is_zero() {
+        let start = Instant::now();
+        let s = timeline(start, &[(0, 0)]);
+        assert_eq!(
+            windowed_bps(&s, start, Duration::from_millis(1000), Duration::ZERO),
+            0.0
+        );
+    }
 }

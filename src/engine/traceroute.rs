@@ -28,6 +28,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// `family` (from `--ipv4-only` / `--ipv6-only` or the bound source IP's
 /// family) restricts which resolved address is probed. When `interface` is set
 /// on Linux, `SO_BINDTODEVICE` keeps probes on that NIC.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_traceroute(
     destination: &str,
     max_hops: u8,
@@ -35,12 +36,13 @@ pub async fn run_traceroute(
     bind_ip: Option<IpAddr>,
     interface: Option<&str>,
     family: Option<IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<TracerouteSummary> {
     // Resolve destination to IP, honoring the requested family when set.
     let ip = resolve_destination(destination, family)?;
 
     // Try raw ICMP first
-    match run_icmp_traceroute(&ip, max_hops, event_tx, bind_ip, interface).await {
+    match run_icmp_traceroute(&ip, max_hops, event_tx, bind_ip, interface, dscp).await {
         Ok(summary) => return Ok(summary),
         Err(e) => {
             // Send info about fallback
@@ -54,7 +56,7 @@ pub async fn run_traceroute(
 
     // Fall back to system traceroute. `family` is forwarded so a --ipv4-only /
     // --ipv6-only restriction forces the matching family on the system tool.
-    run_system_traceroute(destination, &ip, max_hops, event_tx, bind_ip, interface, family).await
+    run_system_traceroute(destination, &ip, max_hops, event_tx, bind_ip, interface, family, dscp).await
 }
 
 /// Resolve destination hostname to IP address. When `family` is set, return an
@@ -92,6 +94,7 @@ async fn run_icmp_traceroute(
     event_tx: &mpsc::Sender<TestEvent>,
     bind_ip: Option<IpAddr>,
     interface: Option<&str>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<TracerouteSummary> {
     // Check if we're dealing with IPv4 - IPv6 traceroute is more complex
     let dest_v4 = match destination {
@@ -130,6 +133,11 @@ async fn run_icmp_traceroute(
         super::network_bind::bind_socket_to_device(&socket, iface, false).map_err(|e| {
             anyhow::anyhow!("Failed to bind raw ICMP socket to interface {}: {}", iface, e)
         })?;
+    }
+
+    // Best-effort DSCP marking on the raw probe socket (IPv4 only here).
+    if let Some(dist) = dscp {
+        let _ = super::dscp::apply(&socket, dist.select(), false);
     }
 
     socket.set_read_timeout(Some(PROBE_TIMEOUT))?;
@@ -283,6 +291,7 @@ fn resolve_hostname(_ip: &IpAddr) -> Option<String> {
 }
 
 /// Fall back to system traceroute command.
+#[allow(clippy::too_many_arguments)]
 async fn run_system_traceroute(
     destination: &str,
     destination_ip: &IpAddr,
@@ -291,6 +300,7 @@ async fn run_system_traceroute(
     bind_ip: Option<IpAddr>,
     interface: Option<&str>,
     family: Option<IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Result<TracerouteSummary> {
     // Clone strings to avoid lifetime issues with spawn_blocking
     let dest = destination.to_string();
@@ -359,6 +369,13 @@ async fn run_system_traceroute(
         if let Some(ip) = bind_ip {
             args.push("-s".to_string());
             args.push(ip.to_string());
+        }
+        // traceroute(8) takes the full TOS byte via -t (Windows tracert has no
+        // equivalent flag, so the marking is skipped there). The system command
+        // is one process, so a single weighted draw applies to the whole run.
+        if let Some(dist) = dscp {
+            args.push("-t".to_string());
+            args.push(super::dscp::tos_byte(dist.select()).to_string());
         }
         args.push(dest.clone());
         (cmd, args)

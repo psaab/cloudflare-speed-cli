@@ -231,6 +231,7 @@ pub async fn fetch_external_ips(
     bind_ip: Option<std::net::IpAddr>,
     cert_path: Option<&std::path::Path>,
     family: Option<super::network_bind::IpFamily>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> (Option<String>, Option<String>) {
     use super::network_bind::IpFamily;
 
@@ -248,14 +249,14 @@ pub async fn fetch_external_ips(
     let (ipv4, ipv6) = tokio::join!(
         async {
             if want_v4 {
-                fetch_external_ip_version(&url, &hostname, IpVersion::V4, interface, bind_ip, cert_path).await
+                fetch_external_ip_version(&url, &hostname, IpVersion::V4, interface, bind_ip, cert_path, dscp).await
             } else {
                 None
             }
         },
         async {
             if want_v6 {
-                fetch_external_ip_version(&url, &hostname, IpVersion::V6, interface, bind_ip, cert_path).await
+                fetch_external_ip_version(&url, &hostname, IpVersion::V6, interface, bind_ip, cert_path, dscp).await
             } else {
                 None
             }
@@ -271,6 +272,7 @@ enum IpVersion {
     V6,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_external_ip_version(
     url: &str,
     hostname: &str,
@@ -278,6 +280,7 @@ async fn fetch_external_ip_version(
     interface: Option<&str>,
     bind_ip: Option<std::net::IpAddr>,
     cert_path: Option<&std::path::Path>,
+    dscp: Option<&super::dscp::DscpDist>,
 ) -> Option<String> {
     use super::network_bind;
     use std::net::SocketAddr;
@@ -302,6 +305,9 @@ async fn fetch_external_ip_version(
         .timeout(Duration::from_secs(5));
     if let Some(path) = cert_path {
         builder = builder.add_root_certificate(super::cert::load_reqwest_certificate(path).ok()?);
+    }
+    if let Some(dist) = dscp {
+        builder = builder.tos_picker(dist.picker());
     }
     let client = network_bind::apply_bind(builder, interface, bind_ip)
         .build()
